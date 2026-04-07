@@ -1,9 +1,12 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, File, UploadFile
 from typing import List, Optional
 from app.models.schemas import User, SKU, StoreSession, CartItem, Purchase, PantryItem
 from app.db.mongodb import db_config
 from bson import ObjectId
 from datetime import datetime, timedelta
+import cv2
+import numpy as np
+from vision.main import VisionSystem# Reusing your class
 
 router = APIRouter()
 
@@ -26,6 +29,28 @@ SKU_PRICES = {
     "SKU-001": 85.00, "SKU-002": 40.00, "SKU-003": 30.00, "SKU-004": 55.00,
     "SKU-005": 45.00, "SKU-006": 15.00, "SKU-007": 15.00, "SKU-008": 50.00,
 }
+
+
+vision_sessions = {}
+
+@router.post("/detect-frame/{session_id}")
+async def detect_frame(session_id: str, file: UploadFile = File(...)):
+    # 1. Initialize Vision for this session if it doesn't exist
+    if session_id not in vision_sessions:
+        vision_sessions[session_id] = VisionSystem(session_id)
+    
+    # 2. Decode the frame from mobile
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Invalid image")
+
+    # 3. Process frame and return state
+    result = vision_sessions[session_id].process_api_frame(frame)
+    return {"status": "success", "data": result}
+
 
 @router.post("/items", response_model=SKU)
 async def create_sku(sku: SKU):
@@ -172,3 +197,30 @@ async def get_purchase_history(user_id: str):
         })
         history[date_key]["total"] += price * item.get("quantity", 1)
     return list(history.values())
+
+
+# backend/app/api/endpoints.py
+
+@router.get("/analytics/sales-summary") # Changed from /sales to /sales-summary
+async def get_sales_analytics():
+    """Aggregates total sales and revenue per SKU."""
+    pipeline = [
+        {"$match": {"status": "purchased"}},
+        {"$group": {
+            "_id": "$sku_id",
+            "total_sold": {"$sum": "$quantity"},
+        }}
+    ]
+    results = await db_config.db["pantry"].aggregate(pipeline).to_list(100)
+    
+    enriched_results = []
+    for res in results:
+        sku_id = res["_id"]
+        # Use the catalog to add names and calculate revenue
+        enriched_results.append({
+            "sku_id": sku_id,
+            "name": SKU_NAMES.get(sku_id, sku_id),
+            "total_sold": res["total_sold"],
+            "revenue": res["total_sold"] * SKU_PRICES.get(sku_id, 0)
+        })
+    return enriched_results

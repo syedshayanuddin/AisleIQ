@@ -1,15 +1,84 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 import './index.css';
+import Webcam from "react-webcam";
 
-const API = 'http://localhost:8000/api/v1';
+const API = 'http://192.168.0.105:8000/api/v1';
 const SESSION = '69a7633f26e35f1ab5ab2916';
 const USER_ID = 'demo_user';
 
 const SKU_PRICES = {
   'SKU-001': 85, 'SKU-002': 40, 'SKU-003': 30, 'SKU-004': 55,
-  'SKU-005': 45, 'SKU-006': 15, 'SKU-007': 15, 'SKU-008': 50,
+  'SKU-005': 45, 'SKU-006': 10, 'SKU-007': 15, 'SKU-008': 50,
 };
+
+
+
+function CartTab({ onCheckoutDone }) {
+  const [items, setItems] = useState([]);
+  const webcamRef = useRef(null);
+
+  // Function to capture and send frame
+  const capture = useCallback(async () => {
+  if (webcamRef.current) {
+    const imageSrc = webcamRef.current.getScreenshot();
+    if (!imageSrc) return; // If this is null, it won't send anything!
+
+    const blob = await fetch(imageSrc).then(res => res.blob());
+    const formData = new FormData();
+    formData.append('file', blob, 'frame.jpg');
+
+    await axios.post(`${API}/detect-frame/${SESSION}`, formData, {
+    headers: {
+      'bypass-tunnel-reminder': 'true',
+      'Content-Type': 'multipart/form-data',
+  }
+});
+  }
+}, [webcamRef]); // Make sure webcamRef is in this array
+
+  // Frame Capture Heartbeat: 2 FPS (every 500ms)
+  useEffect(() => {
+    const interval = setInterval(capture, 1000);
+    return () => clearInterval(interval);
+  }, [capture]);
+
+  // Existing fetchCart for UI updates
+  useEffect(() => {
+    const t = setInterval(async () => {
+      const res = await axios.get(`${API}/cart/${SESSION}`);
+      setItems(res.data);
+    }, 2000);
+    return () => clearInterval(t);
+  }, []);
+
+  return (
+    <>
+      <div className="header">
+        <h1>🛒 Mobile Scanner</h1>
+        <div className="badge"><span className="pulse" /> Camera Streaming</div>
+      </div>
+
+      {/* Camera Preview with "Zone" Overlay */}
+      <div className="camera-container" style={{ position: 'relative', overflow: 'hidden', borderRadius: '20px', margin: '10px' }}>
+        <Webcam
+          audio={false}
+          ref={webcamRef}
+          screenshotFormat="image/jpeg"
+          videoConstraints={{ facingMode: "environment" }} // Use back camera
+          style={{ width: '100%', display: 'block' }}
+        />
+        {/* Visual Line for Cart Zone */}
+        <div style={{ position: 'absolute', top: '50%', width: '100%', height: '2px', background: 'red', boxShadow: '0 0 10px red' }} />
+        <div style={{ position: 'absolute', top: '10%', left: '10px', color: 'white', fontSize: '10px', fontWeight: 'bold' }}>SHELF</div>
+        <div style={{ position: 'absolute', bottom: '10%', left: '10px', color: 'white', fontSize: '10px', fontWeight: 'bold' }}>CART</div>
+      </div>
+
+      {/* ... Rest of your Cart Items list logic ... */}
+    </>
+  );
+}
+
 
 function daysUntil(dateStr) {
   const diff = new Date(dateStr) - new Date();
@@ -52,86 +121,86 @@ const HistoryIcon = () => (
   </svg>
 );
 
-// ── Live Cart Tab ─────────────────────────────────────────────────────────────
-function CartTab({ onCheckoutDone }) {
-  const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [checking, setChecking] = useState(false);
+// // ── Live Cart Tab ─────────────────────────────────────────────────────────────
+// function CartTab({ onCheckoutDone }) {
+//   const [items, setItems] = useState([]);
+//   const [loading, setLoading] = useState(false);
+//   const [checking, setChecking] = useState(false);
 
-  const fetchCart = useCallback(async () => {
-    try {
-      const res = await axios.get(`${API}/cart/${SESSION}`);
-      setItems(res.data);
-    } catch { }
-  }, []);
+//   const fetchCart = useCallback(async () => {
+//     try {
+//       const res = await axios.get(`${API}/cart/${SESSION}`);
+//       setItems(res.data);
+//     } catch { }
+//   }, []);
 
-  useEffect(() => {
-    fetchCart();
-    const t = setInterval(fetchCart, 2000);
-    return () => clearInterval(t);
-  }, [fetchCart]);
+//   useEffect(() => {
+//     fetchCart();
+//     const t = setInterval(fetchCart, 2000);
+//     return () => clearInterval(t);
+//   }, [fetchCart]);
 
-  const total = items.reduce((s, i) => s + (SKU_PRICES[i.sku_id] ?? 0) * (i.quantity ?? 1), 0);
+//   const total = items.reduce((s, i) => s + (SKU_PRICES[i.sku_id] ?? 0) * (i.quantity ?? 1), 0);
 
-  const handleCheckout = async () => {
-    if (!items.length) return;
-    setChecking(true);
-    try {
-      await axios.post(`${API}/checkout/${SESSION}?user_id=${USER_ID}`);
-      setItems([]);
-      onCheckoutDone();
-    } catch (e) {
-      alert('Checkout failed: ' + (e.response?.data?.detail || e.message));
-    } finally { setChecking(false); }
-  };
+//   const handleCheckout = async () => {
+//     if (!items.length) return;
+//     setChecking(true);
+//     try {
+//       await axios.post(`${API}/checkout/${SESSION}?user_id=${USER_ID}`);
+//       setItems([]);
+//       onCheckoutDone();
+//     } catch (e) {
+//       alert('Checkout failed: ' + (e.response?.data?.detail || e.message));
+//     } finally { setChecking(false); }
+//   };
 
-  return (
-    <>
-      <div className="header">
-        <h1>🛒 Live Cart</h1>
-        <p>Items detected by vision system</p>
-        <div className="badge"><span className="pulse" />Vision System Active</div>
-      </div>
+//   return (
+//     <>
+//       <div className="header">
+//         <h1>🛒 Live Cart</h1>
+//         <p>Items detected by vision system</p>
+//         <div className="badge"><span className="pulse" />Vision System Active</div>
+//       </div>
 
-      {items.length === 0 ? (
-        <div className="empty">
-          <CartIcon />
-          <p>Your cart is empty.<br />Move a product below the red line<br />in the vision system.</p>
-        </div>
-      ) : (
-        <>
-          <div className="card">
-            <div className="card-header">
-              Cart Items <span className="label">{items.length} item(s)</span>
-            </div>
-            {items.map((item, i) => (
-              <div className="cart-item" key={i}>
-                <div>
-                  <div className="item-name">{item.sku_id.replace('SKU-', '#') + ' ' + (item.sku_id)}</div>
-                  <div className="item-name" style={{ color: '#f0f2f8', fontSize: 13 }}>{getSkuName(item.sku_id)}</div>
-                  <div className="item-sub">Qty: {item.quantity ?? 1} · Added {new Date(item.added_at).toLocaleTimeString()}</div>
-                </div>
-                <div className="item-price">₹{(SKU_PRICES[item.sku_id] ?? 0).toFixed(2)}</div>
-              </div>
-            ))}
-          </div>
+//       {items.length === 0 ? (
+//         <div className="empty">
+//           <CartIcon />
+//           <p>Your cart is empty.<br />Move a product below the red line<br />in the vision system.</p>
+//         </div>
+//       ) : (
+//         <>
+//           <div className="card">
+//             <div className="card-header">
+//               Cart Items <span className="label">{items.length} item(s)</span>
+//             </div>
+//             {items.map((item, i) => (
+//               <div className="cart-item" key={i}>
+//                 <div>
+//                   <div className="item-name">{item.sku_id.replace('SKU-', '#') + ' ' + (item.sku_id)}</div>
+//                   <div className="item-name" style={{ color: '#f0f2f8', fontSize: 13 }}>{getSkuName(item.sku_id)}</div>
+//                   <div className="item-sub">Qty: {item.quantity ?? 1} · Added {new Date(item.added_at).toLocaleTimeString()}</div>
+//                 </div>
+//                 <div className="item-price">₹{(SKU_PRICES[item.sku_id] ?? 0).toFixed(2)}</div>
+//               </div>
+//             ))}
+//           </div>
 
-          <div className="total-bar">
-            <div>
-              <div className="label">Cart Total</div>
-              <div className="amount">₹{total.toFixed(2)}</div>
-            </div>
-            <div style={{ fontSize: 13, opacity: .8 }}>{items.length} items</div>
-          </div>
+//           <div className="total-bar">
+//             <div>
+//               <div className="label">Cart Total</div>
+//               <div className="amount">₹{total.toFixed(2)}</div>
+//             </div>
+//             <div style={{ fontSize: 13, opacity: .8 }}>{items.length} items</div>
+//           </div>
 
-          <button className="btn-checkout" onClick={handleCheckout} disabled={checking}>
-            {checking ? 'Processing...' : '✓ Checkout & Pay'}
-          </button>
-        </>
-      )}
-    </>
-  );
-}
+//           <button className="btn-checkout" onClick={handleCheckout} disabled={checking}>
+//             {checking ? 'Processing...' : '✓ Checkout & Pay'}
+//           </button>
+//         </>
+//       )}
+//     </>
+//   );
+// }
 
 function getSkuName(skuId) {
   const names = {
