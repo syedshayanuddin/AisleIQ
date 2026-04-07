@@ -7,47 +7,45 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__f
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, RedirectResponse
 import logging
 from app.core.config import settings
 from app.db.mongodb import connect_to_mongo, close_mongo_connection
 from app.api.endpoints import router as api_router
 
-from fastapi.middleware.cors import CORSMiddleware
+logging.basicConfig(level=logging.INFO)
 
-app = FastAPI()
+app = FastAPI(title=settings.PROJECT_NAME)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # Allow the local frontend
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-logging.basicConfig(level=logging.INFO)
-
-app = FastAPI(title=settings.PROJECT_NAME)
-
-# Add this block! 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # In a real app, use ["https://madalyn-rebuffable-hilda.ngrok-free.dev"]
-    allow_credentials=True,
-    allow_methods=["*"], # Allows POST, GET, OPTIONS, etc.
-    allow_headers=["*"], # Allows 'bypass-tunnel-reminder' and other custom headers
-)
-
 app.include_router(api_router, prefix="/api/v1")
 
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:3000"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
+# Serve the built mobile React app via ngrok HTTPS (camera-safe)
+MOBILE_DIST = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "mobile", "dist"
+))
 
-# app.include_router(api_router, prefix="/api/v1")
+if os.path.isdir(MOBILE_DIST):
+    # Mount /assets so index.html's absolute /assets/... references resolve correctly
+    app.mount(
+        "/assets",
+        StaticFiles(directory=os.path.join(MOBILE_DIST, "assets")),
+        name="assets",
+    )
+
+    @app.get("/mobile")
+    async def serve_mobile():
+        """Serve the React SPA — phone opens this URL via ngrok HTTPS."""
+        return FileResponse(os.path.join(MOBILE_DIST, "index.html"))
+
 
 @app.on_event("startup")
 async def startup_db_client():
@@ -59,4 +57,4 @@ async def shutdown_db_client():
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to AisleIQ API"}
+    return RedirectResponse(url="/mobile")

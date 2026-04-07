@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, File, UploadFile
+import logging
 from typing import List, Optional
 from app.models.schemas import User, SKU, StoreSession, CartItem, Purchase, PantryItem
 from app.db.mongodb import db_config
@@ -35,21 +36,45 @@ vision_sessions = {}
 
 @router.post("/detect-frame/{session_id}")
 async def detect_frame(session_id: str, file: UploadFile = File(...)):
-    # 1. Initialize Vision for this session if it doesn't exist
+    # 1. Init VisionSystem for this session if needed
     if session_id not in vision_sessions:
         vision_sessions[session_id] = VisionSystem(session_id)
-    
-    # 2. Decode the frame from mobile
+
+    # 2. Decode the uploaded frame
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
     if frame is None:
         raise HTTPException(status_code=400, detail="Invalid image")
 
-    # 3. Process frame and return state
+    # 3. Run vision — returns {add:[...], remove:[...], cart_skus:[...], raw_predictions:[...]}
     result = vision_sessions[session_id].process_api_frame(frame)
-    return {"status": "success", "data": result}
+
+    # 4. Write cart changes directly to MongoDB (no HTTP round-trip → no deadlock)
+    now = datetime.utcnow()
+    for sku_id in result.get("add", []):
+        existing = await db_config.db["cart"].find_one(
+            {"session_id": session_id, "sku_id": sku_id, "status": "in_cart"}
+        )
+        if not existing:
+            await db_config.db["cart"].insert_one({
+                "session_id": session_id,
+                "sku_id":     sku_id,
+                "quantity":   1,
+                "status":     "in_cart",
+                "added_at":   now,
+            })
+            logging.info(f"DB ADD: {sku_id} → session {session_id}")
+
+    for sku_id in result.get("remove", []):
+        await db_config.db["cart"].find_one_and_delete(
+            {"session_id": session_id, "sku_id": sku_id, "status": "in_cart"},
+            sort=[("added_at", 1)],
+        )
+        logging.info(f"DB REMOVE: {sku_id} → session {session_id}")
+
+    return {"status": "ok", "data": result}
+
 
 
 @router.post("/items", response_model=SKU)

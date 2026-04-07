@@ -1,15 +1,11 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import basicSsl from '@vitejs/plugin-basic-ssl'
 
-// https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), basicSsl()],
   server: {
-    host: true, // This is the same as the --host flag
-    allowedHosts: [
-      'syeds-macbook-air.local',
-      'localhost',
-      '.local' // This covers any local network address
-    ]
+    host: true,
+    https: true,
   }
 })
