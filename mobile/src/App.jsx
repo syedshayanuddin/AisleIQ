@@ -68,7 +68,7 @@ function LoginScreen({ onLogin }) {
       <div className="login-card">
 
         <div className="login-logo">🛒</div>
-        <h1 className="login-title">AisleIQ</h1>
+        <h1 className="login-title">Aisle<span style={{color:'var(--accent2)'}}>IQ</span></h1>
         <p className="login-sub">Smart shopping, zero waiting</p>
 
         {/* Mode toggle */}
@@ -118,7 +118,7 @@ function LoginScreen({ onLogin }) {
 
 const SKU_PRICES = {
   'SKU-001': 85, 'SKU-002': 40, 'SKU-003': 30, 'SKU-004': 55,
-  'SKU-005': 45, 'SKU-006': 10, 'SKU-007': 15, 'SKU-008': 50,
+  'SKU-005': 45, 'SKU-006': 20, 'SKU-007': 15, 'SKU-008': 50,
 };
 
 
@@ -303,7 +303,7 @@ const HomeIcon = () => (
 function getSkuName(skuId) {
   const names = {
     'SKU-001': 'Coca Cola 1.5L', 'SKU-002': 'Coca Cola 290mL', 'SKU-003': 'Datu Puti Soy Sauce 200mL',
-    'SKU-004': 'Datu Puti Soy Sauce 385mL', 'SKU-005': 'Palmolive Soap', 'SKU-006': 'Pancit Canton Chilimansi',
+    'SKU-004': 'Datu Puti Soy Sauce 385mL', 'SKU-005': 'Palmolive Soap', 'SKU-006': 'Pebbly - Packaged Drinking Water',
     'SKU-007': 'Pancit Canton Extra Hot Chili', 'SKU-008': 'Safeguard Soap',
   };
   return names[skuId] ?? skuId;
@@ -325,7 +325,9 @@ function HomeTab({ auth, alertCount, onStartShopping, onLogout }) {
   return (
     <>
       <div className="header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <h1>🛒 AisleIQ</h1>
+        <h1 style={{ fontStyle:'italic', fontWeight:900, textTransform:'uppercase', letterSpacing:'-0.5px', fontSize:'22px' }}>
+          Aisle<span style={{color:'var(--accent2)'}}>IQ</span>
+        </h1>
         <button className="logout-btn" onClick={onLogout}>Log Out</button>
       </div>
 
@@ -501,10 +503,22 @@ function HistoryTab({ userId }) {
   );
 }
 
+// ── Root App helpers ──────────────────────────────────────────────────
+function saveCartSession(userId, data) {
+  if (data) localStorage.setItem(`aisleiq_cart_${userId}`, JSON.stringify(data));
+  else       localStorage.removeItem(`aisleiq_cart_${userId}`);
+}
+function getStoredCart(userId) {
+  try { const s = localStorage.getItem(`aisleiq_cart_${userId}`); return s ? JSON.parse(s) : null; }
+  catch { return null; }
+}
+
 // ── Root App ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [auth, setAuth]               = useState(getStoredAuth);
-  const [cartSession, setCartSession] = useState(null);
+  const [cartSession, setCartSession] = useState(() => {
+    const a = getStoredAuth(); return a ? getStoredCart(a.user_id) : null;
+  });
   const [tab, setTab]                 = useState('home');
   const [pantryRefresh, setPantryRefresh] = useState(0);
   const [alertCount, setAlertCount]   = useState(0);
@@ -524,19 +538,26 @@ export default function App() {
   const handleLogin = (data) => { setAuth(data); setTab('home'); };
 
   const handleStartShopping = async () => {
-    const params = `?display_name=${encodeURIComponent(auth.display_name)}`;
-    const res = await axios.post(`${API}/session/create${params}`, null, { headers: HEADERS });
-    setCartSession({ session_id: res.data.session_id });
+    // Pass user_id so backend abandons stale sessions for this user
+    const params = new URLSearchParams({ display_name: auth.display_name, user_id: auth.user_id });
+    const res = await axios.post(`${API}/session/create?${params}`, null, { headers: HEADERS });
+    const session = { session_id: res.data.session_id };
+    setCartSession(session);
+    saveCartSession(auth.user_id, session);   // survive page refresh
     setTab('cart');
   };
 
   const handleCheckoutDone = () => {
+    saveCartSession(auth.user_id, null);      // clear persisted session
     setCartSession(null);
     setPantryRefresh(r => r + 1);
     setTab('pantry');
   };
 
-  const handleLogout = () => { clearAuth(); setAuth(null); setCartSession(null); setTab('home'); };
+  const handleLogout = () => {
+    if (auth) saveCartSession(auth.user_id, null);
+    clearAuth(); setAuth(null); setCartSession(null); setTab('home');
+  };
 
   if (!auth) return <LoginScreen onLogin={handleLogin} />;
 

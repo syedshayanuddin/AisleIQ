@@ -94,18 +94,18 @@ def _random_name() -> str:
 SHELF_LIFE = {
     "SKU-001": 180, "SKU-002": 180,
     "SKU-003": 365, "SKU-004": 365,
-    "SKU-005": 730, "SKU-006": 3,
+    "SKU-005": 730, "SKU-006": 365,
     "SKU-007": 3,   "SKU-008": 730,
 }
 SKU_NAMES = {
     "SKU-001": "Coca Cola 1.5L",               "SKU-002": "Coca Cola 290mL",
     "SKU-003": "Datu Puti Soy Sauce 200mL",    "SKU-004": "Datu Puti Soy Sauce 385mL",
-    "SKU-005": "Palmolive Soap",               "SKU-006": "Pancit Canton Chilimansi",
+    "SKU-005": "Palmolive Soap",               "SKU-006": "Pebbly - Packaged Drinking Water",
     "SKU-007": "Pancit Canton Extra Hot Chili","SKU-008": "Safeguard Soap",
 }
 SKU_PRICES = {
     "SKU-001": 85.00, "SKU-002": 40.00, "SKU-003": 30.00, "SKU-004": 55.00,
-    "SKU-005": 45.00, "SKU-006": 15.00, "SKU-007": 15.00, "SKU-008": 50.00,
+    "SKU-005": 45.00, "SKU-006": 20.00, "SKU-007": 15.00, "SKU-008": 50.00,
 }
 
 
@@ -114,21 +114,40 @@ vision_sessions = {}
 # ── Session Management ────────────────────────────────────────────────────────
 
 @router.post("/session/create")
-async def create_session_v2(display_name: str = ""):
+async def create_session_v2(display_name: str = "", user_id: str = ""):
     """
     Create a new shopping session.
-    Returns a UUID session_id and a human-readable display name.
+    If user_id is provided, abandon any old active sessions for that user first.
     """
-    session_id   = str(uuid.uuid4())
-    name         = display_name.strip() or _random_name()
-    now          = datetime.utcnow()
+    uid = user_id.strip()
+    if uid:
+        # Find and abandon all previous active sessions for this user
+        old = await db_config.db["sessions_v2"].find(
+            {"user_id": uid, "status": "active"}
+        ).to_list(50)
+        old_ids = [s["session_id"] for s in old]
+        if old_ids:
+            await db_config.db["cart"].update_many(
+                {"session_id": {"$in": old_ids}, "status": "in_cart"},
+                {"$set": {"status": "abandoned"}}
+            )
+            await db_config.db["sessions_v2"].update_many(
+                {"user_id": uid, "status": "active"},
+                {"$set": {"status": "abandoned"}}
+            )
+            logging.info(f"ABANDONED {len(old_ids)} old session(s) for user={uid}")
+
+    session_id = str(uuid.uuid4())
+    name       = display_name.strip() or _random_name()
+    now        = datetime.utcnow()
     await db_config.db["sessions_v2"].insert_one({
         "session_id":   session_id,
         "display_name": name,
+        "user_id":      uid,
         "created_at":   now,
         "status":       "active",
     })
-    logging.info(f"NEW SESSION: {session_id} ({name})")
+    logging.info(f"NEW SESSION: {session_id} ({name}) user={uid}")
     return {"session_id": session_id, "display_name": name, "created_at": now}
 
 
@@ -293,28 +312,59 @@ async def checkout(session_id: str, user_id: str = "demo_user"):
     for item in cart_items:
         sku_id   = item["sku_id"]
         price    = SKU_PRICES.get(sku_id, 0.0)
-        days     = SHELF_LIFE.get(sku_id, 365)
         name     = SKU_NAMES.get(sku_id, sku_id)
-        total   += price * item.get("quantity", 1)
+        qty      = item.get("quantity", 1)
+        total   += price * qty
+
+        # FIFO: try to get real expiry from oldest active inventory batch
+        expiry_date = None
+        batch = await db_config.db["inventory_batches"].find_one(
+            {"sku_id": sku_id, "quantity_remaining": {"$gt": 0}},
+            sort=[("expiry_date", 1)]   # oldest first
+        )
+        if batch:
+            expiry_date = batch["expiry_date"]
+            # Decrement batch quantity
+            await db_config.db["inventory_batches"].update_one(
+                {"_id": batch["_id"]},
+                {"$inc": {"quantity_remaining": -qty}}
+            )
+            logging.info(f"FIFO: {sku_id} → batch {batch['batch_id']} exp {expiry_date.date()}")
+        else:
+            # Fallback: use hardcoded shelf life
+            days = SHELF_LIFE.get(sku_id, 365)
+            expiry_date = now + timedelta(days=days)
+            logging.info(f"FIFO fallback: {sku_id} → {days} days")
+
         pantry_docs.append({
             "user_id":       user_id,
             "sku_id":        sku_id,
             "name":          name,
-            "quantity":      item.get("quantity", 1),
+            "quantity":      qty,
             "purchase_date": now,
-            "expiry_date":   now + timedelta(days=days),
+            "expiry_date":   expiry_date,
             "status":        "in_pantry",
         })
 
-    # Insert pantry items
+    # Insert pantry items + record session as completed
     if pantry_docs:
         await db_config.db["pantry"].insert_many(pantry_docs)
 
-    # Mark cart as purchased
+    # Mark cart items as purchased
     await db_config.db["cart"].update_many(
         {"session_id": session_id, "status": "in_cart"},
         {"$set": {"status": "purchased"}}
     )
+
+    # Mark session as completed → disappears from live dashboard
+    await db_config.db["sessions_v2"].update_one(
+        {"session_id": session_id},
+        {"$set": {"status": "completed"}}
+    )
+
+    # Clear in-memory vision state for this session
+    if session_id in vision_sessions:
+        del vision_sessions[session_id]
 
     return {
         "message":    "Checkout successful",
@@ -371,28 +421,150 @@ async def get_purchase_history(user_id: str):
     return list(history.values())
 
 
+@router.get("/analytics/recent-purchases")
+async def get_recent_purchases(limit: int = 30):
+    """Latest purchase records across all users — for the live activity feed."""
+    docs = await db_config.db["pantry"].find(
+        {}, sort=[("purchase_date", -1)]
+    ).limit(limit).to_list(limit)
+    return [
+        {
+            "user_id":       d.get("user_id", "?"),
+            "name":          d.get("name", SKU_NAMES.get(d.get("sku_id", ""), "Unknown")),
+            "sku_id":        d.get("sku_id", ""),
+            "quantity":      d.get("quantity", 1),
+            "price":         SKU_PRICES.get(d.get("sku_id", ""), 0),
+            "purchase_date": d["purchase_date"].isoformat() if d.get("purchase_date") else None,
+        }
+        for d in docs
+    ]
+
+
 # backend/app/api/endpoints.py
 
-@router.get("/analytics/sales-summary") # Changed from /sales to /sales-summary
+@router.get("/analytics/sales-summary")
 async def get_sales_analytics():
-    """Aggregates total sales and revenue per SKU."""
+    """Aggregates real total sales and revenue per SKU from all pantry items."""
     pipeline = [
-        {"$match": {"status": "purchased"}},
+        # All pantry items = verified purchases regardless of current status
         {"$group": {
             "_id": "$sku_id",
             "total_sold": {"$sum": "$quantity"},
         }}
     ]
     results = await db_config.db["pantry"].aggregate(pipeline).to_list(100)
-    
-    enriched_results = []
+    enriched = []
     for res in results:
         sku_id = res["_id"]
-        # Use the catalog to add names and calculate revenue
-        enriched_results.append({
-            "sku_id": sku_id,
-            "name": SKU_NAMES.get(sku_id, sku_id),
+        enriched.append({
+            "sku_id":     sku_id,
+            "name":       SKU_NAMES.get(sku_id, sku_id),
             "total_sold": res["total_sold"],
-            "revenue": res["total_sold"] * SKU_PRICES.get(sku_id, 0)
+            "revenue":    res["total_sold"] * SKU_PRICES.get(sku_id, 0),
         })
-    return enriched_results
+    return sorted(enriched, key=lambda x: x["total_sold"], reverse=True)
+
+
+@router.get("/analytics/customers")
+async def get_customer_analytics():
+    """Per-customer purchase analytics: total spend, items bought, last purchase."""
+    pipeline = [
+        {"$group": {
+            "_id":           "$user_id",
+            "total_items":   {"$sum": "$quantity"},
+            "total_spend":   {"$sum": {"$multiply": ["$quantity",
+                                {"$ifNull": [{"$toDouble": "$price"}, 0]}]}},
+            "last_purchase": {"$max": "$purchase_date"},
+            "sku_list":      {"$push": "$sku_id"},
+        }}
+    ]
+    raw = await db_config.db["pantry"].aggregate(pipeline).to_list(100)
+
+    # Enrich with revenue calculated server-side (price is in SKU_PRICES)
+    pipeline2 = [
+        {"$group": {
+            "_id":         "$user_id",
+            "total_items": {"$sum": "$quantity"},
+            "last_purchase": {"$max": "$purchase_date"},
+            "skus":        {"$push": {"sku_id": "$sku_id", "qty": "$quantity"}},
+        }}
+    ]
+    results = await db_config.db["pantry"].aggregate(pipeline2).to_list(100)
+    customers = []
+    for r in results:
+        spend = sum(s["qty"] * SKU_PRICES.get(s["sku_id"], 0) for s in r["skus"])
+        top_sku = max(r["skus"], key=lambda s: s["qty"], default={"sku_id": ""})
+        customers.append({
+            "user_id":      r["_id"],
+            "total_items":  r["total_items"],
+            "total_spend":  round(spend, 2),
+            "last_purchase": r["last_purchase"].isoformat() if r["last_purchase"] else None,
+            "top_sku":      SKU_NAMES.get(top_sku.get("sku_id", ""), top_sku.get("sku_id", "")),
+        })
+    return sorted(customers, key=lambda x: x["total_spend"], reverse=True)
+
+
+# ── FIFO Inventory Batch System ───────────────────────────────────────────────────
+class ReceiveBatchRequest(BaseModel):
+    sku_id:     str
+    batch_id:   str
+    expiry_date: str   # ISO format: "2025-09-15"
+    quantity:   int
+
+@router.post("/inventory/receive")
+async def receive_batch(body: ReceiveBatchRequest):
+    """Store manager logs a new inventory batch arrival."""
+    expiry = datetime.fromisoformat(body.expiry_date)
+    existing = await db_config.db["inventory_batches"].find_one(
+        {"sku_id": body.sku_id, "batch_id": body.batch_id}
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Batch ID already exists for this SKU")
+    await db_config.db["inventory_batches"].insert_one({
+        "sku_id":             body.sku_id,
+        "batch_id":           body.batch_id,
+        "expiry_date":        expiry,
+        "quantity_received":  body.quantity,
+        "quantity_remaining": body.quantity,
+        "received_at":        datetime.utcnow(),
+    })
+    logging.info(f"BATCH RECEIVED: {body.sku_id} | {body.batch_id} | exp {expiry.date()} | qty {body.quantity}")
+    return {
+        "message":     "Batch recorded",
+        "sku_id":      body.sku_id,
+        "batch_id":    body.batch_id,
+        "expiry_date": expiry.isoformat(),
+        "quantity":    body.quantity,
+        "sku_name":    SKU_NAMES.get(body.sku_id, body.sku_id),
+    }
+
+
+@router.get("/inventory/batches")
+async def list_batches():
+    """List all inventory batches (for dashboard inventory manager)."""
+    batches = await db_config.db["inventory_batches"].find(
+        {}, sort=[("sku_id", 1), ("expiry_date", 1)]
+    ).to_list(500)
+    for b in batches:
+        b["_id"] = str(b["_id"])
+        b["sku_name"] = SKU_NAMES.get(b["sku_id"], b["sku_id"])
+    return batches
+
+
+@router.get("/inventory/expiry/{sku_id}")
+async def get_fifo_expiry(sku_id: str):
+    """Returns the oldest active batch expiry for a given SKU (FIFO peek)."""
+    batch = await db_config.db["inventory_batches"].find_one(
+        {"sku_id": sku_id, "quantity_remaining": {"$gt": 0}},
+        sort=[("expiry_date", 1)]
+    )
+    if not batch:
+        days = SHELF_LIFE.get(sku_id, 365)
+        return {"sku_id": sku_id, "source": "default", "expiry_date": None, "shelf_life_days": days}
+    return {
+        "sku_id":             sku_id,
+        "source":             "fifo_batch",
+        "batch_id":           batch["batch_id"],
+        "expiry_date":        batch["expiry_date"].isoformat(),
+        "quantity_remaining": batch["quantity_remaining"],
+    }

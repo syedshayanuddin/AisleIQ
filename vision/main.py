@@ -19,9 +19,10 @@ SESSION_ID = "69a7633f26e35f1ab5ab2916"
 # ── Roboflow Config ───────────────────────────────────────────────────────────
 ROBOFLOW_API_KEY  = "1UBfVlKOa3A7H5RF7ntB"
 MODEL_ID          = "dali-grocery-items-zcdvo/13"
-CONFIDENCE        = 0.15  # Lowered for testing; raise back to 0.40 in production
+CONFIDENCE        = 0.55  # 0.55 balances recall vs precision well
 INFER_EVERY_N     = 5      # Submit a new frame for inference every N frames
-REMOVE_TIMEOUT_N  = 60    # Fallback: remove after this many missed inferences (~30s)
+REMOVE_TIMEOUT_N  = 60    # Fallback: remove after this many missed inferences
+STABILITY_REQUIRED = 2    # Must appear in N consecutive inferences before cart ADD
 
 CLIENT = InferenceHTTPClient(
     api_url="https://serverless.roboflow.com",
@@ -84,13 +85,14 @@ class VisionSystem:
     def __init__(self, session_id):
         self.api = APIClient(session_id=session_id)
         self.session_id = session_id
-        self.cart_skus = set()
-        self.absence_count = defaultdict(int)
-        self.sku_names = {}
-        self.last_boxes = []
+        self.cart_skus      = set()
+        self.absence_count  = defaultdict(int)
+        self.stable_count   = defaultdict(int)  # consecutive frames item appeared in cart zone
+        self.sku_names      = {}
+        self.last_boxes     = []
         self.inference_thread = InferenceThread()
         self.inference_thread.start()
-        self.frame_count = 0
+        self.frame_count    = 0
 
     def process_api_frame(self, frame: np.ndarray):
         """
@@ -116,37 +118,67 @@ class VisionSystem:
             else:
                 logger.info("[DEBUG] Roboflow returned 0 predictions.")
 
-            in_cart_now = set()
+            in_cart_now  = set()
             in_shelf_now = set()
+
+            # ── Top-1 per zone: track highest-confidence SKU seen in each zone ──
+            # Prevents 1 physical item from triggering multiple different SKU adds.
+            best_cart  = {}  # sku_id → confidence
+            best_shelf = {}  # sku_id → confidence
 
             for pred in predictions:
                 if pred["confidence"] < CONFIDENCE:
                     continue
                 sku_id = label_to_sku(pred["class"])
-                cy = int(pred["y"])
+                conf   = pred["confidence"]
+                cy     = int(pred.get("y", 0))
                 if cy > cart_zone_y:
-                    in_cart_now.add(sku_id)
+                    if conf > best_cart.get(sku_id, -1):
+                        best_cart[sku_id] = conf
                 else:
-                    in_shelf_now.add(sku_id)
+                    if conf > best_shelf.get(sku_id, -1):
+                        best_shelf[sku_id] = conf
 
-            # Items newly in cart zone → ADD
+            # If multiple different SKUs detected in cart zone, keep only the best one
+            if len(best_cart) > 1:
+                top_sku = max(best_cart, key=best_cart.get)
+                logger.info(f"TOP-1 FILTER: keeping {top_sku} ({best_cart[top_sku]:.2f}) "
+                            f"over {[s for s in best_cart if s != top_sku]}")
+                best_cart = {top_sku: best_cart[top_sku]}
+
+            in_cart_now  = set(best_cart.keys())
+            in_shelf_now = set(best_shelf.keys())
+
+
+            # Items newly visible in cart zone → increment stability counter
             for sku in in_cart_now:
                 self.absence_count[sku] = 0
+                self.stable_count[sku] += 1
                 if sku not in self.cart_skus:
-                    self.cart_skus.add(sku)
-                    to_add.append(sku)
-                    logger.info(f"CART ADD: {sku}")
+                    if self.stable_count[sku] >= STABILITY_REQUIRED:
+                        self.cart_skus.add(sku)
+                        to_add.append(sku)
+                        logger.info(f"CART ADD (stable x{self.stable_count[sku]}): {sku}")
+                    else:
+                        logger.info(f"CART PENDING ({self.stable_count[sku]}/{STABILITY_REQUIRED}): {sku}")
 
-            # Items back on shelf or timed out → REMOVE
+            # Items back on shelf or absent → reset stability and remove from cart
             for sku in list(self.cart_skus):
                 if sku in in_shelf_now:
                     self.cart_skus.discard(sku)
+                    self.stable_count[sku] = 0
                     to_remove.append(sku)
                 elif sku not in in_cart_now:
                     self.absence_count[sku] += 1
                     if self.absence_count[sku] >= REMOVE_TIMEOUT_N:
                         self.cart_skus.discard(sku)
+                        self.stable_count[sku] = 0
                         to_remove.append(sku)
+
+            # Also reset stability for items no longer in cart zone (prevents ghost adds)
+            for sku in list(self.stable_count.keys()):
+                if sku not in in_cart_now and sku not in self.cart_skus:
+                    self.stable_count[sku] = 0
 
         raw = [{"class": p["class"], "confidence": round(p["confidence"], 3)} for p in predictions]
         return {
