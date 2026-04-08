@@ -3,12 +3,118 @@ import axios from 'axios';
 import './index.css';
 import Webcam from "react-webcam";
 
-// 🔧 TESTING: Swap this URL depending on your setup:
-// Local (same WiFi, no HTTPS):  'http://192.168.0.105:8000/api/v1'
-// ngrok (HTTPS, for phone cam): 'https://madalyn-rebuffable-hilda.ngrok-free.dev/api/v1'
+// 🔧 API URL — update if ngrok URL changes
 const API = 'https://madalyn-rebuffable-hilda.ngrok-free.dev/api/v1';
-const SESSION = '69a7633f26e35f1ab5ab2916';
-const USER_ID = 'demo_user';
+
+
+// ── Session helpers ──────────────────────────────────────────────────────────────
+const HEADERS = { 'bypass-tunnel-reminder': 'true' };
+
+function saveAuth(data) { localStorage.setItem('aisleiq_auth', JSON.stringify(data)); }
+function getStoredAuth() {
+  try { const s = localStorage.getItem('aisleiq_auth'); return s ? JSON.parse(s) : null; }
+  catch { return null; }
+}
+function clearAuth() { localStorage.removeItem('aisleiq_auth'); }
+
+// ── Login / Register Screen ──────────────────────────────────────────────────────
+function LoginScreen({ onLogin }) {
+  const [mode, setMode]         = useState('login');   // 'login' | 'register'
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [loading, setLoading]   = useState(false);
+  const [error, setError]       = useState('');
+  const [success, setSuccess]   = useState('');
+
+  const reset = () => { setError(''); setSuccess(''); };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!username.trim() || !password.trim()) {
+      setError('Username and password are required'); return;
+    }
+    if (mode === 'register' && !displayName.trim()) {
+      setError('Please enter your display name'); return;
+    }
+    setLoading(true); setError('');
+    try {
+      if (mode === 'register') {
+        await axios.post(`${API}/auth/register`,
+          { username: username.trim(), password, display_name: displayName.trim() },
+          { headers: HEADERS }
+        );
+        setSuccess('Account created! Logging you in…');
+      }
+      // Login (after register or directly)
+      const res = await axios.post(`${API}/auth/login`,
+        { username: username.trim(), password },
+        { headers: HEADERS }
+      );
+      const data = {
+        user_id:      res.data.user_id,
+        display_name: res.data.display_name,
+      };
+      saveAuth(data);
+      onLogin(data);
+    } catch (err) {
+      const msg = err.response?.data?.detail || 'Connection failed. Check your network.';
+      setError(msg);
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="login-screen">
+      <div className="login-card">
+
+        <div className="login-logo">🛒</div>
+        <h1 className="login-title">AisleIQ</h1>
+        <p className="login-sub">Smart shopping, zero waiting</p>
+
+        {/* Mode toggle */}
+        <div className="login-tabs">
+          <button className={`login-tab ${mode === 'login' ? 'active' : ''}`}
+            onClick={() => { setMode('login'); reset(); }}>Log In</button>
+          <button className={`login-tab ${mode === 'register' ? 'active' : ''}`}
+            onClick={() => { setMode('register'); reset(); }}>Register</button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="login-form">
+          {mode === 'register' && (
+            <div className="login-field">
+              <label className="login-label">Display Name</label>
+              <input className="login-input" type="text" placeholder="How should we call you?"
+                value={displayName} onChange={e => setDisplayName(e.target.value)} maxLength={40} />
+            </div>
+          )}
+          <div className="login-field">
+            <label className="login-label">Username</label>
+            <input className="login-input" type="text" placeholder="Enter username"
+              value={username} onChange={e => { setUsername(e.target.value); reset(); }}
+              autoCapitalize="none" autoCorrect="off" maxLength={30} />
+          </div>
+          <div className="login-field">
+            <label className="login-label">Password</label>
+            <input className="login-input" type="password" placeholder="Enter password"
+              value={password} onChange={e => { setPassword(e.target.value); reset(); }}
+              maxLength={100} />
+          </div>
+
+          {error   && <p className="login-error">{error}</p>}
+          {success && <p className="login-success">{success}</p>}
+
+          <button className="login-btn" type="submit" disabled={loading}>
+            {loading ? 'Please wait…'
+              : mode === 'login' ? 'Log In →'
+              : 'Create Account →'}
+          </button>
+        </form>
+
+        <p className="login-note">Your session is saved on this device.</p>
+      </div>
+    </div>
+  );
+}
 
 const SKU_PRICES = {
   'SKU-001': 85, 'SKU-002': 40, 'SKU-003': 30, 'SKU-004': 55,
@@ -17,14 +123,18 @@ const SKU_PRICES = {
 
 
 
-function CartTab({ onCheckoutDone }) {
+
+function CartTab({ session, onCheckoutDone }) {
   const [items, setItems] = useState([]);
   const [checking, setChecking] = useState(false);
   const webcamRef = useRef(null);
 
+  const sessionId = session.session_id;
+  const userId    = session.user_id;        // username — must match pantry/history lookups
+
   // Capture a frame and POST it to the detect-frame endpoint
   const capture = useCallback(async () => {
-    if (!webcamRef.current) return;
+    if (!webcamRef.current || !sessionId) return;
     const imageSrc = webcamRef.current.getScreenshot();
     if (!imageSrc) return;
 
@@ -33,14 +143,14 @@ function CartTab({ onCheckoutDone }) {
     formData.append('file', blob, 'frame.jpg');
 
     try {
-      await axios.post(`${API}/detect-frame/${SESSION}`, formData, {
+      await axios.post(`${API}/detect-frame/${sessionId}`, formData, {
         headers: {
           'bypass-tunnel-reminder': 'true',
           'Content-Type': 'multipart/form-data',
         },
       });
     } catch { /* silently ignore network hiccups */ }
-  }, [webcamRef]);
+  }, [webcamRef, sessionId]);
 
   // Frame capture heartbeat — 1 FPS (every 1000 ms)
   useEffect(() => {
@@ -50,24 +160,29 @@ function CartTab({ onCheckoutDone }) {
 
   // Poll cart every 2 s for UI updates
   useEffect(() => {
+    if (!sessionId) return;
     const fetchCart = async () => {
       try {
-        const res = await axios.get(`${API}/cart/${SESSION}`);
+        const res = await axios.get(`${API}/cart/${sessionId}`, {
+          headers: { 'bypass-tunnel-reminder': 'true' },
+        });
         setItems(res.data);
       } catch { }
     };
     fetchCart();
     const t = setInterval(fetchCart, 2000);
     return () => clearInterval(t);
-  }, []);
+  }, [sessionId]);
 
   const total = items.reduce((s, i) => s + (SKU_PRICES[i.sku_id] ?? 0) * (i.quantity ?? 1), 0);
 
   const handleCheckout = async () => {
-    if (!items.length) return;
+    if (!items.length || !sessionId) return;
     setChecking(true);
     try {
-      await axios.post(`${API}/checkout/${SESSION}?user_id=${USER_ID}`);
+      await axios.post(`${API}/checkout/${sessionId}?user_id=${encodeURIComponent(userId)}`, null, {
+        headers: { 'bypass-tunnel-reminder': 'true' },
+      });
       setItems([]);
       onCheckoutDone();
     } catch (e) {
@@ -79,7 +194,7 @@ function CartTab({ onCheckoutDone }) {
     <>
       <div className="header">
         <h1>🛒 Mobile Scanner</h1>
-        <div className="badge"><span className="pulse" /> Camera Streaming</div>
+        <div className="badge"><span className="pulse" /> {session.display_name}</div>
       </div>
 
       {/* Camera Preview with Zone Overlay */}
@@ -177,6 +292,11 @@ const HistoryIcon = () => (
     <polyline points="12 8 12 12 14 14" /><path d="M3.05 11a9 9 0 1 1 .5 4m-.5 5v-5h5" />
   </svg>
 );
+const HomeIcon = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><polyline points="9 22 9 12 15 12 15 22" />
+  </svg>
+);
 
 
 
@@ -189,23 +309,69 @@ function getSkuName(skuId) {
   return names[skuId] ?? skuId;
 }
 
+// ── Home Tab ──────────────────────────────────────────────────────────────────
+function HomeTab({ auth, alertCount, onStartShopping, onLogout }) {
+  const [starting, setStarting] = useState(false);
+
+  const handleStart = async () => {
+    setStarting(true);
+    try { await onStartShopping(); }
+    catch { alert('Could not start session. Check your connection.'); }
+    finally { setStarting(false); }
+  };
+
+  const initial = (auth.display_name || auth.user_id || '?')[0].toUpperCase();
+
+  return (
+    <>
+      <div className="header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <h1>🛒 AisleIQ</h1>
+        <button className="logout-btn" onClick={onLogout}>Log Out</button>
+      </div>
+
+      <div className="home-welcome">
+        <div className="home-avatar">{initial}</div>
+        <h2 className="home-name">
+          Welcome back,<br /><span>{auth.display_name || auth.user_id}</span>
+        </h2>
+        <p className="home-sub">@{auth.user_id}</p>
+      </div>
+
+      {alertCount > 0 && (
+        <div className="home-alert-banner">
+          ⚠️ {alertCount} item{alertCount > 1 ? 's are' : ' is'} expiring soon!
+        </div>
+      )}
+
+      <div className="home-actions">
+        <button className="btn-start-shopping" onClick={handleStart} disabled={starting}>
+          {starting ? 'Starting…' : '🛒 Start Shopping'}
+        </button>
+        <p className="home-hint">A new cart session will be created when you tap Start Shopping.</p>
+      </div>
+    </>
+  );
+}
+
+
 // ── Pantry Tab ────────────────────────────────────────────────────────────────
-function PantryTab({ refresh }) {
+// ── Pantry Tab ─────────────────────────────────────────────────────────────────────
+function PantryTab({ userId, refresh }) {
   const [items, setItems] = useState([]);
   const [toast, setToast] = useState('');
 
   const fetchPantry = useCallback(async () => {
     try {
-      const res = await axios.get(`${API}/pantry/${USER_ID}`);
+      const res = await axios.get(`${API}/pantry/${encodeURIComponent(userId)}`);
       setItems(res.data);
     } catch { }
-  }, []);
+  }, [userId]);
 
   useEffect(() => { fetchPantry(); }, [fetchPantry, refresh]);
 
   const consume = async (item) => {
     try {
-      await axios.patch(`${API}/pantry/${USER_ID}/${item._id}`);
+      await axios.patch(`${API}/pantry/${encodeURIComponent(userId)}/${item._id}`);
       setItems(prev => prev.filter(i => i._id !== item._id));
       setToast(`✓ ${item.name} marked as consumed`);
       setTimeout(() => setToast(''), 2500);
@@ -249,17 +415,17 @@ function PantryTab({ refresh }) {
 }
 
 // ── Alerts Tab ────────────────────────────────────────────────────────────────
-function AlertsTab() {
+function AlertsTab({ userId }) {
   const [items, setItems] = useState([]);
 
   useEffect(() => {
     (async () => {
       try {
-        const res = await axios.get(`${API}/pantry/${USER_ID}`);
+        const res = await axios.get(`${API}/pantry/${encodeURIComponent(userId)}`);
         setItems(res.data.filter(i => daysUntil(i.expiry_date) <= 5));
       } catch { }
     })();
-  }, []);
+  }, [userId]);
 
   return (
     <>
@@ -289,17 +455,17 @@ function AlertsTab() {
 }
 
 // ── History Tab ───────────────────────────────────────────────────────────────
-function HistoryTab() {
+function HistoryTab({ userId }) {
   const [history, setHistory] = useState([]);
 
   useEffect(() => {
     (async () => {
       try {
-        const res = await axios.get(`${API}/purchases/${USER_ID}`);
+        const res = await axios.get(`${API}/purchases/${encodeURIComponent(userId)}`);
         setHistory(res.data);
       } catch { }
     })();
-  }, []);
+  }, [userId]);
 
   return (
     <>
@@ -337,41 +503,68 @@ function HistoryTab() {
 
 // ── Root App ──────────────────────────────────────────────────────────────────
 export default function App() {
-  const [tab, setTab] = useState('cart');
+  const [auth, setAuth]               = useState(getStoredAuth);
+  const [cartSession, setCartSession] = useState(null);
+  const [tab, setTab]                 = useState('home');
   const [pantryRefresh, setPantryRefresh] = useState(0);
-  const [alertCount, setAlertCount] = useState(0);
+  const [alertCount, setAlertCount]   = useState(0);
+
+  const userId = auth?.user_id ?? '';
 
   useEffect(() => {
+    if (!auth) return;
     (async () => {
       try {
-        const res = await axios.get(`${API}/pantry/${USER_ID}`);
+        const res = await axios.get(`${API}/pantry/${encodeURIComponent(userId)}`);
         setAlertCount(res.data.filter(i => daysUntil(i.expiry_date) <= 5).length);
       } catch { }
     })();
-  }, [pantryRefresh]);
+  }, [pantryRefresh, auth]);
+
+  const handleLogin = (data) => { setAuth(data); setTab('home'); };
+
+  const handleStartShopping = async () => {
+    const params = `?display_name=${encodeURIComponent(auth.display_name)}`;
+    const res = await axios.post(`${API}/session/create${params}`, null, { headers: HEADERS });
+    setCartSession({ session_id: res.data.session_id });
+    setTab('cart');
+  };
 
   const handleCheckoutDone = () => {
+    setCartSession(null);
     setPantryRefresh(r => r + 1);
     setTab('pantry');
   };
 
+  const handleLogout = () => { clearAuth(); setAuth(null); setCartSession(null); setTab('home'); };
+
+  if (!auth) return <LoginScreen onLogin={handleLogin} />;
+
+  const fullSession = cartSession
+    ? { ...cartSession, user_id: auth.user_id, display_name: auth.display_name }
+    : null;
+
   return (
     <>
       <div className="page">
-        {tab === 'cart' && <CartTab onCheckoutDone={handleCheckoutDone} />}
-        {tab === 'pantry' && <PantryTab refresh={pantryRefresh} />}
-        {tab === 'alerts' && <AlertsTab />}
-        {tab === 'history' && <HistoryTab />}
+        {tab === 'home'    && <HomeTab auth={auth} alertCount={alertCount} onStartShopping={handleStartShopping} onLogout={handleLogout} />}
+        {tab === 'cart'    && fullSession  && <CartTab session={fullSession} onCheckoutDone={handleCheckoutDone} />}
+        {tab === 'cart'    && !fullSession && <HomeTab auth={auth} alertCount={alertCount} onStartShopping={handleStartShopping} onLogout={handleLogout} />}
+        {tab === 'pantry'  && <PantryTab userId={userId} refresh={pantryRefresh} />}
+        {tab === 'alerts'  && <AlertsTab userId={userId} />}
+        {tab === 'history' && <HistoryTab userId={userId} />}
       </div>
 
       <nav className="bottom-nav">
         {[
-          { id: 'cart', icon: <CartIcon />, label: 'Cart' },
-          { id: 'pantry', icon: <PantryIcon />, label: 'Pantry' },
-          { id: 'alerts', icon: <AlertIcon />, label: 'Alerts', badge: alertCount },
+          { id: 'home',    icon: <HomeIcon />,    label: 'Home' },
+          { id: 'pantry',  icon: <PantryIcon />,  label: 'Pantry' },
+          { id: 'alerts',  icon: <AlertIcon />,   label: 'Alerts',  badge: alertCount },
           { id: 'history', icon: <HistoryIcon />, label: 'History' },
+          ...(cartSession ? [{ id: 'cart', icon: <CartIcon />, label: 'Cart', badge: 0 }] : []),
         ].map(({ id, icon, label, badge }) => (
-          <button key={id} className={`nav-btn ${tab === id ? 'active' : ''}`} onClick={() => setTab(id)} style={{ position: 'relative' }}>
+          <button key={id} className={`nav-btn ${tab === id ? 'active' : ''}`}
+            onClick={() => setTab(id)} style={{ position: 'relative' }}>
             {icon}
             {badge > 0 && <span className="nav-dot" />}
             {label}
@@ -381,3 +574,4 @@ export default function App() {
     </>
   );
 }
+

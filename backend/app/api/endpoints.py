@@ -9,7 +9,84 @@ import cv2
 import numpy as np
 from vision.main import VisionSystem# Reusing your class
 
+import uuid
+import random
+from passlib.context import CryptContext
+from pydantic import BaseModel
+import bcrypt as _bcrypt
+
+# Use bcrypt directly (avoids passlib/bcrypt 4.x incompatibility)
+def _hash_pw(password: str) -> str:
+    return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
+
+def _verify_pw(password: str, hashed: str) -> bool:
+    return _bcrypt.checkpw(password.encode(), hashed.encode())
+
+pwd_ctx = None  # kept for import compatibility, not used
+
 router = APIRouter()
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    display_name: str = ""
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@router.post("/auth/register")
+async def register(body: RegisterRequest):
+    """Create a new user account."""
+    username = body.username.strip().lower()
+    if not username or not body.password:
+        raise HTTPException(status_code=400, detail="Username and password are required")
+    existing = await db_config.db["users"].find_one({"username": username})
+    if existing:
+        raise HTTPException(status_code=409, detail="Username already taken")
+    display = body.display_name.strip() or username.capitalize()
+    await db_config.db["users"].insert_one({
+        "username":      username,
+        "password_hash": _hash_pw(body.password),
+        "display_name":  display,
+        "created_at":    datetime.utcnow(),
+    })
+    return {"message": "Account created", "username": username, "display_name": display}
+
+
+@router.post("/auth/login")
+async def login(body: LoginRequest):
+    """Verify credentials and return a fresh shopping session."""
+    username = body.username.strip().lower()
+    user = await db_config.db["users"].find_one({"username": username})
+    if not user or not _verify_pw(body.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    # Create a fresh session for this login
+    session_id = str(uuid.uuid4())
+    display    = user["display_name"]
+    now        = datetime.utcnow()
+    await db_config.db["sessions_v2"].insert_one({
+        "session_id":   session_id,
+        "user_id":      username,
+        "display_name": display,
+        "created_at":   now,
+        "status":       "active",
+    })
+    logging.info(f"LOGIN: {username} → session {session_id}")
+    return {
+        "session_id":   session_id,
+        "user_id":      username,
+        "display_name": display,
+    }
+
+_ADJECTIVES = ["Swift", "Bright", "Cool", "Fresh", "Smart", "Quick", "Bold", "Keen"]
+_NOUNS      = ["Shopper", "Buyer", "Customer", "User", "Guest", "Member"]
+
+def _random_name() -> str:
+    return f"{random.choice(_ADJECTIVES)}-{random.choice(_NOUNS)}-{random.randint(10, 99)}"
+
 
 # ── SKU Catalog ───────────────────────────────────────────────────────────────
 # In-memory shelf life lookup (mirrors seed_skus.py)
@@ -33,6 +110,76 @@ SKU_PRICES = {
 
 
 vision_sessions = {}
+
+# ── Session Management ────────────────────────────────────────────────────────
+
+@router.post("/session/create")
+async def create_session_v2(display_name: str = ""):
+    """
+    Create a new shopping session.
+    Returns a UUID session_id and a human-readable display name.
+    """
+    session_id   = str(uuid.uuid4())
+    name         = display_name.strip() or _random_name()
+    now          = datetime.utcnow()
+    await db_config.db["sessions_v2"].insert_one({
+        "session_id":   session_id,
+        "display_name": name,
+        "created_at":   now,
+        "status":       "active",
+    })
+    logging.info(f"NEW SESSION: {session_id} ({name})")
+    return {"session_id": session_id, "display_name": name, "created_at": now}
+
+
+@router.get("/sessions/active")
+async def get_active_sessions():
+    """
+    Return all sessions that currently have at least one in_cart item.
+    Enriches each with display_name from sessions_v2 collection.
+    """
+    # Aggregate distinct session_ids with in_cart items
+    pipeline = [
+        {"$match": {"status": "in_cart"}},
+        {"$group": {
+            "_id":        "$session_id",
+            "item_count": {"$sum": 1},
+            "items":      {"$push": "$sku_id"},
+            "last_updated": {"$max": "$added_at"},
+        }},
+        {"$sort": {"last_updated": -1}},
+    ]
+    active = await db_config.db["cart"].aggregate(pipeline).to_list(100)
+
+    # Fetch display names for known sessions
+    session_ids = [s["_id"] for s in active]
+    meta_cursor = db_config.db["sessions_v2"].find({"session_id": {"$in": session_ids}})
+    meta_list   = await meta_cursor.to_list(100)
+    name_map    = {m["session_id"]: m["display_name"] for m in meta_list}
+
+    return [
+        {
+            "session_id":   s["_id"],
+            "display_name": name_map.get(s["_id"], "Unknown Shopper"),
+            "item_count":   s["item_count"],
+            "items":        s["items"],
+            "last_updated": s["last_updated"],
+        }
+        for s in active
+    ]
+
+
+@router.get("/status")
+async def system_status():
+    """System health + active session count for dashboard."""
+    active_sessions = await db_config.db["cart"].distinct("session_id", {"status": "in_cart"})
+    total_items     = await db_config.db["cart"].count_documents({"status": "in_cart"})
+    return {
+        "status":          "online",
+        "active_sessions": len(active_sessions),
+        "total_items":     total_items,
+        "vision_sessions": list(vision_sessions.keys()),
+    }
 
 @router.post("/detect-frame/{session_id}")
 async def detect_frame(session_id: str, file: UploadFile = File(...)):
